@@ -1,0 +1,131 @@
+@startuml
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Кеширование списка заказов MES с Cache-Aside паттерном
+
+actor Operator as op
+participant "MES\n(React)" as ui
+participant "MES API\n(C#)" as api
+participant "Redis Cache" as redis
+participant "MES DB\n(PostgreSQL)" as db
+participant "RabbitMQ" as mq
+participant "CRM API\n(Spring Boot)" as crm
+
+== Сценарий 1: Чтение списка заказов (Cache Hit) ==
+
+op -> ui: Открывает дашборд\nс фильтром по статусу
+activate ui
+
+ui -> api: GET /api/orders?status=MANUFACTURING_APPROVED
+activate api
+
+api -> redis: GET orders:status:MANUFACTURING_APPROVED
+activate redis
+redis --> api: Возвращает закешированный список
+deactivate redis
+
+api --> ui: Список заказов (200 OK)
+deactivate api
+
+ui --> op: Отображает заказы
+deactivate ui
+
+== Сценарий 2: Чтение списка заказов (Cache Miss) ==
+
+op -> ui: Открывает дашборд\nс другим фильтром
+activate ui
+
+ui -> api: GET /api/orders?status=MANUFACTURING_STARTED
+activate api
+
+api -> redis: GET orders:status:MANUFACTURING_STARTED
+activate redis
+redis --> api: null (кеш пуст)
+deactivate redis
+
+api -> db: SELECT * FROM orders\nWHERE status = 'MANUFACTURING_STARTED'
+activate db
+db --> api: Список заказов из БД
+deactivate db
+
+api -> redis: SET orders:status:MANUFACTURING_STARTED\n[данные]\nTTL = 30 секунд
+activate redis
+redis --> api: OK
+deactivate redis
+
+api --> ui: Список заказов (200 OK)
+deactivate api
+
+ui --> op: Отображает заказы
+deactivate ui
+
+== Сценарий 3: Изменение статуса заказа (Write + Cache Invalidation) ==
+
+op -> ui: Берёт заказ #12345 в работу
+activate ui
+
+ui -> api: POST /api/orders/12345/start
+activate api
+
+api -> db: UPDATE orders\nSET status = 'MANUFACTURING_STARTED'\nWHERE id = 12345
+activate db
+db --> api: Обновлено успешно
+deactivate db
+
+api -> redis
+activate redis
+note right: Инвалидация кеша
+redis --> api: OK
+deactivate redis
+
+api -> mq: Публикует событие:\nOrderStatusChanged\n{orderId: 12345,\noldStatus: MANUFACTURING_APPROVED,\nnewStatus: MANUFACTURING_STARTED}
+activate mq
+mq --> api: Событие принято
+deactivate mq
+
+api --> ui: Статус обновлён (200 OK)
+deactivate api
+
+ui --> op: Отображает обновлённый статус
+deactivate ui
+
+mq -> crm: Доставляет событие\nOrderStatusChanged
+activate crm
+crm -> crm: Обновляет заказ\nв CRM БД
+crm --> mq: ACK
+deactivate crm
+deactivate mq
+
+== Сценарий 4: Повторное чтение после инвалидации ==
+
+op -> ui: Обновляет страницу дашборда
+activate ui
+
+ui -> api: GET /api/orders?status=MANUFACTURING_STARTED
+activate api
+
+api -> redis: GET orders:status:MANUFACTURING_STARTED
+activate redis
+redis --> api: null (кеш инвалидирован)
+deactivate redis
+
+api -> db: SELECT * FROM orders\nWHERE status = 'MANUFACTURING_STARTED'
+activate db
+note right: Теперь включает\nзаказ #12345
+db --> api: Обновлённый список
+deactivate db
+
+api -> redis: SET orders:status:MANUFACTURING_STARTED\n[новые данные]\nTTL = 30 секунд
+activate redis
+redis --> api: OK
+deactivate redis
+
+api --> ui: Обновлённый список (200 OK)
+deactivate api
+
+ui --> op: Отображает заказ #12345\nв новом статусе
+deactivate ui
+
+@enduml
